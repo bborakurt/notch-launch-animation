@@ -1,0 +1,681 @@
+<!doctype html>
+<!--
+  Notch Launch Animation — one self-contained file. Open it in a browser; no build, no dependencies.
+
+  How this file is laid out (top to bottom):
+    1. SETTINGS     colours, rings, text, timing, and which effect plays each phase
+    2. CORE         stage, rings, dust particles, clock, playback
+    3. EFFECTS      the four phases of the animation, each swappable:
+                      opening "burst"  → character "eyes" → fill "ribbons" → closing "fold"
+    4. START
+
+  To change the look, edit SETTINGS. To change how a phase moves, edit its effect, or register a new one
+  (NotchLaunch.register(phase, name, {...})) and select it in SETTINGS. The contract each phase has to meet
+  is written at the top of the CORE section.
+
+  Working with an AI assistant: give it this whole file and describe what you want. Everything it needs is here.
+  MIT licence (see LICENSE).
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Notch Launch Animation</title>
+<style>
+  :root { --bg: #0b0c10; --fg: #f5f7fa; --line: #262a33; }
+  * { box-sizing: border-box; }
+  body { margin: 0; min-height: 100vh; display: grid; place-items: center; background: var(--bg); color: var(--fg);
+         font: 14px/1.4 -apple-system, BlinkMacSystemFont, system-ui, sans-serif; }
+  main { width: min(1080px, 100%); padding: 24px 16px; display: grid; gap: 14px; }
+  .stage { border-radius: 14px; overflow: hidden; box-shadow: 0 0 0 1px var(--line); cursor: pointer; }
+  .stage > svg { display: block; width: 100%; height: auto; }
+  .controls { display: flex; align-items: center; gap: 12px; }
+  button { height: 30px; padding: 0 14px; border-radius: 8px; border: 1px solid var(--line); background: var(--fg); color: var(--bg); font: 500 13px inherit; font-family: inherit; cursor: pointer; }
+  input[type=range] { flex: 1; accent-color: var(--fg); }
+</style>
+</head>
+<body>
+<main>
+  <div class="stage"><svg id="svg" role="img" aria-label="An animation that opens out of a laptop notch"></svg></div>
+  <div class="controls">
+    <button id="play" type="button">Replay</button>
+    <input id="time" type="range" min="0" max="7" step="0.005" value="0" aria-label="Scrub time">
+  </div>
+</main>
+<script>
+/*
+ * SETTINGS — change anything here and reload.
+ */
+const CONFIG = {
+  // Which effect plays each phase. Effects are registered further down this file; add your own the same way.
+  effects: {
+    opening: "burst",
+    character: "eyes",      // or "none" for no character
+    fill: "ribbons",
+    closing: "fold",
+  },
+
+  // Options for individual effects, by effect name. Anything left out uses the effect's own `defaults`.
+  options: {
+    eyes: { size: 34, color: "#ffffff" },
+    fold: { text: "Click for details" },
+  },
+
+  // Any number of rings: the first half sits left of the notch, the rest on the right.
+  // `value` is how full a ring ends up (0–100); `icon` is SVG path data in a 24 × 24 box; `tints` (optional)
+  // are the colours dust takes on as it flies into that ring.
+  rings: [
+    { color: "#FE3F03", value: 62, tints: ["#FE3F03", "#FF8A5C", "#FFB792"],
+      icon: "M12 2 L14.5 9.5 L22 12 L14.5 14.5 L12 22 L9.5 14.5 L2 12 L9.5 9.5 Z" },
+    { color: "#4DA3FF", value: 23, tints: ["#4DA3FF", "#8FC6FF", "#B6DCFF"],
+      icon: "M12 3 L20 7.5 V16.5 L12 21 L4 16.5 V7.5 Z" },
+  ],
+
+  colors: {
+    dust: ["#FE3F03", "#FF8A5C", "#4DA3FF", "#8FC6FF", "#ffffff", "#3DD18F", "#8B7CFF"],  // hex only
+    island: "#000000",
+    background: ["#0b0c12", "#05060a"],
+  },
+
+  counts: { dust: 320 },
+  seed: 11,                 // a different number gives a different (but repeatable) scatter
+  speed: 1,                 // playback speed: 0.5 is half speed, 2 is double
+
+  notch: { width: 196, height: 34, camera: true },
+  island: { width: 780, height: 200 },
+
+  // Timeline, in seconds. Effects time their own beats inside it (see their `defaults`).
+  timeline: {
+    openingPace: 3.55 / 2.75, openingPaceUntil: 2.75,   // the opening clock (ctx.oc) runs faster until then
+    ringsIn: 2.3,           // rings fade in
+    iconsIn: 3.3,           // icons and labels fade in
+    fillStart: 3.3, fillDuration: 2.06, fillStagger: 0.1,   // ring i fills from fillStart + i × fillStagger
+    close: 5.5,             // rings full, island closed
+    hint: 6.05,
+    end: 7.0,
+  },
+};
+
+</script>
+<script>
+/*
+ * Notch Launch — core
+ * -------------------
+ * The core owns the stage, the rings, the dust particles and the clock. Everything that moves in a
+ * characteristic way is an *effect*, registered under one of four phases:
+ *
+ *   opening    how the island opens out of the notch and where the dust hangs before it's collected
+ *   character  whatever lives in the island while it's open (the eyes); may feed the rings at the end
+ *   fill       how the dust travels from where it hangs into the rings
+ *   closing    how the island closes and what's left on screen
+ *
+ * Pick effects in SETTINGS. To write your own, copy one of the effects below, rename it and change it.
+ *
+ * WRITING AN EFFECT — NotchLaunch.register(phase, name, { defaults, setup(ctx), ... }).
+ * Inside its methods `this` is the effect (keep state on it; `this.options` = defaults + CONFIG.options[name]).
+ * Every method gets `ctx` (see "The context every effect receives" below). Positions are pure functions of t.
+ *
+ *   opening    REQUIRED open(t, ctx) → 0–1 how far the island is open
+ *              REQUIRED hang(p, t, ctx) → {x, y} where dust grain p is before the fill takes it
+ *              optional dustAlpha(t, ctx) → 0–1, setup(ctx), render(t, ctx),
+                       showOutside(p, t, ctx) → true to draw grain p above the island (e.g. dust flying in from outside)
+ *   fill       REQUIRED setup(ctx): ctx.planLandings(ring, grainsInLandingOrder, 0, ctx.split[ring])
+ *                       gives each grain p.f (its share of the ring) and p.L (when it lands)
+ *              REQUIRED pos(p, t, ctx) → {x, y, v}: land on ctx.tipAt(p.ring, p.f) at time p.L;
+ *                       v (0–1) = how far into the ring (the core tints the grain and lifts it above the island);
+ *                       before setting off, return ctx.opening.hang(p, t, ctx)
+              optional curve(ringIndex, u, ctx) → 0–1: the ring's fill over its window (u 0–1); never decreasing.
+                       Default is a smooth ease; return steps for a ring that jumps as bursts land.
+ *   character  all optional: setup, render, claim(ring) → time it takes over the rest of that ring's fill,
+ *              plan(ctx) to plan its own grains into [ctx.split[ring], 1], adjust(q, p, t, ctx) to nudge dust,
+ *              looks(t) → follow the pointer (ctx.state.look), onClick(t) → true if handled. "none" = no character.
+ *   closing    REQUIRED fold(t, ctx) → 0–1 how far the island has closed; optional setup, render, onEnd, onClick, reset
+ *
+ * Why landings are planned: each ring fills along one smooth curve (ctx.fillOf). Every grain is told up front when
+ * that curve says it lands, and its flight is timed to end there, so the ring and the arriving dust stay in step.
+ * Layers (back to front): back, liquid (melts into the island), inside, white (melts like liquid), insideTop
+ * (these three are clipped to the island), top, bar, overlay.
+ */
+(() => {
+"use strict";
+
+// ═══════════════════════════════════════════════════════════════════════════════════════════
+// Helpers (also handed to every effect as ctx.h)
+// ═══════════════════════════════════════════════════════════════════════════════════════════
+const h = {};
+// Critically damped spring with response r seconds: settles fast, never bounces.
+h.crit = (t, r) => { if (t <= 0) return 0; const w = 2 * Math.PI / r; return 1 - (1 + w * t) * Math.exp(-w * t); };
+// CSS-style cubic-bezier(x1, y1, x2, y2).
+h.bez = (x1, y1, x2, y2) => x => { if (x <= 0) return 0; if (x >= 1) return 1; let t = x;
+  for (let i = 0; i < 8; i++) { const cx = 3 * x1, bx = 3 * (x2 - x1) - cx, ax = 1 - cx - bx, f = ((ax * t + bx) * t + cx) * t - x, d = (3 * ax * t + 2 * bx) * t + cx; if (Math.abs(f) < 1e-5) break; t -= f / d; }
+  const cy = 3 * y1, by = 3 * (y2 - y1) - cy, ay = 1 - cy - by; return ((ay * t + by) * t + cy) * t; };
+h.ease = h.bez(.32, .72, 0, 1); h.inOut = h.bez(.65, 0, .35, 1); h.soft = h.bez(.4, 0, .1, 1);
+h.C5 = u => u * u * u * (u * (u * 6 - 15) + 10);                              // quintic smoothstep
+h.clamp = (v, a = 0, b = 1) => Math.min(b, Math.max(a, v));
+h.lerp = (a, b, f) => a + (b - a) * f;
+h.seg = (t, a, b) => h.clamp((t - a) / (b - a));                              // 0 before a, 1 after b
+h.bell = (t, a, b) => Math.sin(h.seg(t, a, b) * Math.PI);                     // 0 → 1 → 0 over [a, b]
+h.span = (t, a, d, f = h.soft) => f(h.seg(t, a, a + d));
+h.hold = (t, a, b, c, d) => h.inOut(h.seg(t, a, b)) * (1 - h.inOut(h.seg(t, c, d)));
+h.blink = (t, a, d) => { const f = h.seg(t, a, a + d); return f <= 0 || f >= 1 ? 0 : 0.5 - 0.5 * Math.cos(f * 2 * Math.PI); };
+h.quad = (a, c, b, q) => { const m = 1 - q; return { x: m * m * a.x + 2 * m * q * c.x + q * q * b.x, y: m * m * a.y + 2 * m * q * c.y + q * q * b.y }; };
+h.set = (n, a) => { for (const k in a) n.setAttribute(k, a[k]); return n; };
+const NS = "http://www.w3.org/2000/svg";
+h.make = (tag, attrs = {}, parent) => { const n = document.createElementNS(NS, tag); h.set(n, attrs); if (parent) parent.appendChild(n); return n; };
+const hex = c => [1, 3, 5].map(i => parseInt(c.slice(i, i + 2), 16));
+h.mixHex = (a, b, f) => "#" + hex(a).map((v, i) => Math.round(h.lerp(v, hex(b)[i], f)).toString(16).padStart(2, "0")).join("");
+// A seeded random stream. Each effect gets its own (ctx.rng("name")), so changing one effect never reshuffles another.
+h.rng = seed => { let s = seed % 2147483647 || 1; return () => (s = (s * 16807) % 2147483647) / 2147483647; };
+const hashName = str => [...str].reduce((a, c) => (a * 31 + c.charCodeAt(0)) >>> 0, 7);
+// A grain: a dot with a short trail (a line back to where it just was).
+h.grain = (parent, color, r, k = 1.3) => { const g = h.make("g", {}, parent);
+  h.make("line", { stroke: color, "stroke-width": (r * k).toFixed(2), "stroke-linecap": "round", opacity: 0 }, g); h.make("circle", { r: r.toFixed(2), fill: color, opacity: 0 }, g); return g; };
+h.drawGrain = (g, q, q0, maxTrail, alpha, trailAlpha = alpha * 0.5) => {
+  const dl = Math.hypot(q.x - q0.x, q.y - q0.y), k = dl > maxTrail ? maxTrail / dl : 1;
+  h.set(g.children[0], { x1: (q.x + (q0.x - q.x) * k).toFixed(1), y1: (q.y + (q0.y - q.y) * k).toFixed(1), x2: q.x.toFixed(1), y2: q.y.toFixed(1), opacity: trailAlpha.toFixed(3) });
+  h.set(g.children[1], { cx: q.x.toFixed(1), cy: q.y.toFixed(1), opacity: alpha.toFixed(3) });
+};
+h.hideGrain = g => { g.children[0].setAttribute("opacity", 0); g.children[1].setAttribute("opacity", 0); };
+
+// ═══════════════════════════════════════════════════════════════════════════════════════════
+// Effect registry
+// ═══════════════════════════════════════════════════════════════════════════════════════════
+const PHASES = ["opening", "character", "fill", "closing"];
+const registry = Object.fromEntries(PHASES.map(p => [p, {}]));
+function register(phase, name, effect) {
+  if (!registry[phase]) throw new Error(`Unknown phase "${phase}". Use one of: ${PHASES.join(", ")}`);
+  registry[phase][name] = effect;
+}
+// A character is optional: "none" leaves the island empty and lets the dust fill the rings alone.
+register("character", "none", {});
+
+// ═══════════════════════════════════════════════════════════════════════════════════════════
+// Start
+// ═══════════════════════════════════════════════════════════════════════════════════════════
+function start(CONFIG, svg = document.getElementById("svg")) {
+  const { set, make, seg, span, clamp, lerp, ease, inOut, C5 } = h;
+  const W = 960, H = 260, CX = W / 2;
+  const NW = CONFIG.notch.width, NH = CONFIG.notch.height, PW = CONFIG.island.width, PH = CONFIG.island.height;
+  const T = CONFIG.timeline, RING_R = 9, RY = 17;
+  const pace = T.openingPace || 1, paceUntil = T.openingPaceUntil || 0;
+
+  // ——— Effects and their options (each effect's `defaults`, overridden by CONFIG.options[effectName]).
+  const fx = {};
+  for (const phase of PHASES) {
+    const name = CONFIG.effects[phase] || (phase === "character" ? "none" : undefined), e = registry[phase][name];
+    if (!e) throw new Error(`No ${phase} effect called "${name}". Registered: ${Object.keys(registry[phase]).join(", ")}`);
+    fx[phase] = e;
+  }
+  const optionsFor = (phase) => ({ ...(fx[phase].defaults || {}), ...((CONFIG.options || {})[CONFIG.effects[phase]] || {}) });
+
+  // ——— Rings: split between the two sides of the notch, the first half on the left, filling outwards.
+  const n = CONFIG.rings.length, nLeft = Math.ceil(n / 2), perSide = Math.max(nLeft, n - nLeft);
+  const SLOT = 64, EAR = 74 + Math.max(0, perSide - 1) * SLOT, BAR = NW + 2 * EAR;
+  const rings = CONFIG.rings.map((r, i) => {
+    const left = i < nLeft, side = left ? -1 : 1, slot = left ? nLeft - 1 - i : i - nLeft;   // slot 0 is next to the notch
+    const window = r.fill || [T.fillStart + i * T.fillStagger, T.fillStart + T.fillDuration + i * T.fillStagger];
+    return { ...r, index: i, side, slot, x: CX + side * (NW / 2 + 37 + slot * SLOT) - 14, y: RY, r: RING_R, window,
+             tints: r.tints || [r.color, h.mixHex(r.color, "#ffffff", 0.35), h.mixHex(r.color, "#ffffff", 0.65)] };
+  });
+
+  // ——— Fill curves: every ring fills on one smooth curve over its window. Effects plan landings against it.
+  // The curve is a smooth quintic unless the fill effect provides its own: curve(ringIndex, u, ctx) → 0–1 for u 0–1
+  // (it must never go down; steps are fine). Landings are planned against whichever curve is used.
+  const progress = (i, t) => seg(t, rings[i].window[0], rings[i].window[1]);
+  const fillOf = (i, t) => { const u = progress(i, t); return fx.fill.curve ? clamp(ctx.fill.curve(i, u, ctx)) : C5(u); };
+  // How fast a ring is filling (1 ≈ the smooth curve's peak); lights the ring's tip while it fills.
+  const rateOf = (i, t) => { const u = progress(i, t); if (!fx.fill.curve) return 16 * u * u * (1 - u) * (1 - u);
+    const d = (rings[i].window[1] - rings[i].window[0]) * 0.02; return u <= 0 || u >= 1 ? 0 : clamp((fillOf(i, t + d) - fillOf(i, t - d)) / (2 * d) * (rings[i].window[1] - rings[i].window[0]) / 1.875, 0, 4); };
+  const timeAt = (i, f) => { let a = rings[i].window[0], b = rings[i].window[1]; for (let k = 0; k < 36; k++) { const m = (a + b) / 2; if (fillOf(i, m) < f) a = m; else b = m; } return (a + b) / 2; };
+  const tipAt = (i, f) => { const r = rings[i], th = -Math.PI / 2 + 2 * Math.PI * r.value / 100 * f; return { x: r.x + RING_R * Math.cos(th), y: RY + RING_R * Math.sin(th) }; };
+  // Give each particle in `list` (already in landing order) a fill fraction p.f in [from, to] and a landing time p.L.
+  const planLandings = (i, list, from, to) => list.forEach((p, k) => { p.f = from + (to - from) * (k + 0.5) / list.length; p.L = timeAt(i, p.f); });
+
+  // ——— The stage. Layers, back to front; effects draw into the ones they need.
+  svg.setAttribute("viewBox", `0 0 ${W} ${H}`);
+  svg.innerHTML = `
+  <defs>
+    <linearGradient id="wall" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="${CONFIG.colors.background[0]}"/><stop offset="1" stop-color="${CONFIG.colors.background[1]}"/></linearGradient>
+    <filter id="goo" x="-30%" y="-60%" width="160%" height="260%"><feGaussianBlur in="SourceGraphic" stdDeviation="4.5" result="b"/><feColorMatrix in="b" mode="matrix" values="1 0 0 0 0  0 1 0 0 0  0 0 1 0 0  0 0 0 20 -9" result="g"/><feComposite in="SourceGraphic" in2="g" operator="atop"/></filter>
+    <filter id="gooW" x="-30%" y="-60%" width="160%" height="260%"><feGaussianBlur in="SourceGraphic" stdDeviation="3" result="b"/><feColorMatrix in="b" mode="matrix" values="1 0 0 0 0  0 1 0 0 0  0 0 1 0 0  0 0 0 18 -8" result="g"/><feComposite in="SourceGraphic" in2="g" operator="atop"/></filter>
+    <filter id="tipBlur" x="-200%" y="-200%" width="500%" height="500%"><feGaussianBlur stdDeviation="2.2"/></filter>
+    <clipPath id="clip"><rect id="clipR"/></clipPath>
+  </defs>
+  <rect width="${W}" height="${H}" fill="url(#wall)"/>
+  <g id="L-back"></g>
+  <g filter="url(#goo)" fill="${CONFIG.colors.island}"><rect x="${CX - NW / 2}" y="-12" width="${NW}" height="${NH + 12}" rx="11"/><rect id="island"/><g id="L-liquid"></g></g>
+  <g clip-path="url(#clip)"><g id="L-inside"></g><g id="L-dustIn"></g><g id="L-white" filter="url(#gooW)"></g><g id="L-insideTop"></g></g>
+  <rect x="${CX - NW / 2}" y="-12" width="${NW}" height="${NH + 12}" rx="11" fill="${CONFIG.colors.island}"/>
+  ${CONFIG.notch.camera ? `<circle cx="${CX}" cy="13" r="3" fill="#0c0d12"/>` : ""}
+  <g id="L-dustTop"></g><g id="L-top"></g><g id="L-bar"></g><g id="L-rings"></g><g id="L-overlay"></g>`;
+  const layer = name => svg.querySelector("#L-" + name);
+  const islandEl = svg.querySelector("#island"), clipEl = svg.querySelector("#clipR");
+
+  // Rings: track, value arc, icon, label, halo (the pulse when full), and a glowing tip where grains land.
+  const ringEls = rings.map(r => { const g = make("g", { opacity: 0 }, layer("rings"));
+    make("circle", { cx: r.x, cy: RY, r: RING_R, fill: "none", stroke: "rgba(255,255,255,.18)", "stroke-width": 2 }, g);
+    const arc = make("circle", { cx: r.x, cy: RY, r: RING_R, fill: "none", stroke: r.color, "stroke-width": 2, "stroke-linecap": "round", transform: `rotate(-90 ${r.x} ${RY})` }, g);
+    const icon = make("svg", { x: r.x - 5.5, y: RY - 5.5, width: 11, height: 11, viewBox: "0 0 24 24", fill: "#fff" }, g); make("path", { d: r.icon || "" }, icon);
+    const label = make("text", { x: r.x + 15, y: RY + 4.2, fill: "#fff", "font-family": "-apple-system, system-ui, sans-serif", "font-size": 12, "font-weight": 600 }, g);
+    const halo = make("circle", { cx: r.x, cy: RY, r: RING_R, fill: "none", stroke: r.color, "stroke-width": 1.5, opacity: 0 }, g);
+    const glow = make("circle", { r: 4.5, fill: r.color, opacity: 0, filter: "url(#tipBlur)" }, g), dot = make("circle", { r: 1.5, fill: "#fff", opacity: 0 }, g);
+    return { g, arc, icon, label, halo, glow, dot }; });
+
+  // ——— The context every effect receives.
+  const state = { t: 0, playing: false, look: { x: 0, y: 0 }, pointer: null, tapAt: -9, reduced: false };
+  const ctx = {
+    h, config: CONFIG, svg, layer, state, fx, defs: svg.querySelector("defs"),
+    W, H, CX, notch: { w: NW, h: NH }, bar: { w: BAR, h: NH }, open: { w: PW, h: PH, cy: NH + (PH - NH) * 0.52 },
+    time: T, rings, fillOf, rateOf, timeAt, tipAt, planLandings,
+    // The opening clock: runs `openingPace` times faster until `openingPaceUntil`, then in real time.
+    oc: t => (t < paceUntil ? Math.max(t, 0) * pace : paceUntil * pace + (t - paceUntil)),
+    rng: name => h.rng((CONFIG.seed || 1) * 7919 + hashName(name)),
+    // The island at a given open (0 → 1) and fold (0 → 1) amount.
+    islandShape: (open, fold) => { const w = lerp(lerp(NW, PW, open), BAR, fold), ht = lerp(lerp(NH, PH, open), NH, fold), r = lerp(lerp(11, 28, open), 16, fold); return { x: CX - w / 2, w, h: ht, r }; },
+  };
+  // Each phase's effect, with its options. Effects can call each other through these, e.g. ctx.opening.hang(p, t, ctx).
+  // Inside an effect's own methods, `this` is its entry here, so it can keep its own state on `this`.
+  for (const phase of PHASES) ctx[phase] = { ...fx[phase], options: optionsFor(phase), ctx };
+
+  // ——— Dust: the core owns the grains; the opening decides where they hang, the fill how they travel.
+  const rd = ctx.rng("dust");
+  const dust = Array.from({ length: CONFIG.counts.dust }, (_, i) => ({ i, c: CONFIG.colors.dust[i % CONFIG.colors.dust.length], r: 0.7 + rd() * 1.0, u: rd(), tint: rd(), mixAt: -1 }));
+  ctx.dust = dust;
+  const dustIn = dust.map(p => h.grain(layer("dustIn"), p.c, p.r)), dustTop = dust.map(p => h.grain(layer("dustTop"), p.c, p.r));
+
+  // ——— Setup, in order. The opening places the dust; each grain then belongs to a ring on its own side.
+  ctx.opening.setup && ctx.opening.setup(ctx);
+  const sortT = rings[0].window[0];
+  dust.forEach(p => {
+    const x = ctx.opening.hang(p, sortT, ctx).x, side = x < CX ? -1 : 1, mine = rings.filter(r => r.side === side), pool = mine.length ? mine : rings;
+    p.ring = pool[Math.floor(p.u * pool.length)].index;
+    const tints = rings[p.ring].tints, tint = tints[Math.floor(p.tint * tints.length)];
+    p.mix = Array.from({ length: 9 }, (_, k) => h.mixHex(p.c, tint, k / 8));   // 9 steps from its own colour to its ring's tint
+  });
+  ctx.character.setup && ctx.character.setup(ctx);
+  // How much of each ring the dust fills; a character that claims a ring takes over the rest from that moment.
+  ctx.split = rings.map(r => (ctx.character.claim ? clamp(fillOf(r.index, ctx.character.claim(r, ctx))) : 1));
+  ctx.fill.setup && ctx.fill.setup(ctx);
+  ctx.character.plan && ctx.character.plan(ctx);
+  ctx.closing.setup && ctx.closing.setup(ctx);
+
+  // ═══════════════════════════════════════════════════════════════════════════════════════════
+  // Drawing
+  // ═══════════════════════════════════════════════════════════════════════════════════════════
+  function drawRings(t, appear, iconA, fills, halo) {
+    ringEls.forEach((e, i) => {
+      const r = rings[i], c = 2 * Math.PI * RING_R, fill = fills[i];
+      set(e.g, { opacity: appear.toFixed(3) });
+      set(e.arc, { "stroke-dasharray": `${(c * r.value / 100 * fill).toFixed(2)} ${c.toFixed(2)}` });
+      set(e.icon, { opacity: iconA.toFixed(3) }); set(e.label, { opacity: iconA.toFixed(3) }); e.label.textContent = `${Math.round(r.value * fill)}%`;
+      const tip = tipAt(i, fill), lit = state.reduced ? 0 : appear * Math.min(1, rateOf(i, t) * 1.1);
+      set(e.glow, { cx: tip.x.toFixed(2), cy: tip.y.toFixed(2), opacity: (0.75 * lit).toFixed(3) }); set(e.dot, { cx: tip.x.toFixed(2), cy: tip.y.toFixed(2), opacity: (0.9 * lit).toFixed(3) });
+      set(e.halo, { r: RING_R + 16 * ease(halo), opacity: (0.7 * (1 - ease(halo)) * (halo > 0 && halo < 1 ? 1 : 0)).toFixed(3) });
+    });
+  }
+
+  function render(t) {
+    if (state.reduced) return renderReduced();
+    const open = ctx.opening.open(t, ctx), fold = ctx.closing.fold(t, ctx), I = ctx.islandShape(open, fold);
+    ctx.island = { ...I, open, fold };
+    set(islandEl, { x: I.x, y: -30, width: I.w, height: I.h + 30, rx: I.r, opacity: open > 0 ? 1 : 0 });
+    set(clipEl, { x: I.x, y: 0, width: I.w, height: I.h, rx: I.r });
+
+    ctx.opening.render && ctx.opening.render(t, ctx);
+    ctx.character.render && ctx.character.render(t, ctx);
+
+    // Dust: positions from the fill effect (which starts from the opening's hang), nudged by the character.
+    const vis = (ctx.opening.dustAlpha ? ctx.opening.dustAlpha(t, ctx) : 1) * (1 - span(t, T.close - 0.35, 0.5));
+    const at = (p, tt) => { const q = ctx.fill.pos(p, tt, ctx); return ctx.character.adjust ? ctx.character.adjust(q, p, tt, ctx) : q; };
+    dust.forEach((p, i) => {
+      if (vis <= 0) { h.hideGrain(dustIn[i]); h.hideGrain(dustTop[i]); return; }
+      const q = at(p, t), q0 = at(p, t - 0.025), v = q.v || 0;
+      const mk = Math.round(8 * inOut(seg(v, 0.45, 1)));                   // take on the ring's tint late in the flight
+      if (mk !== p.mixAt) { p.mixAt = mk; for (const g of [dustIn[i], dustTop[i]]) { g.children[0].setAttribute("stroke", p.mix[mk]); g.children[1].setAttribute("fill", p.mix[mk]); } }
+      // A grain is drawn above the island near its ring, or whenever the opening says it's outside the island
+      // (showOutside(p, t, ctx) → true); otherwise it's clipped to the island.
+      const out = ctx.opening.showOutside && ctx.opening.showOutside(p, t, ctx);
+      const a = vis * (0.8 + 0.2 * Math.sin(t * 7 + i * 1.7)) * (1 - seg(v, 0.94, 1)), up = out ? 1 : seg(v, 0.8, 0.9);
+      h.drawGrain(dustIn[i], q, q0, 8, a * (1 - up)); h.drawGrain(dustTop[i], q, q0, 8, a * up);
+    });
+    ctx.fill.render && ctx.fill.render(t, ctx);
+
+    drawRings(t, span(t, T.ringsIn, 0.6), span(t, T.iconsIn, 0.5), rings.map((r, i) => fillOf(i, t)), seg(t, T.close, T.close + 0.55));
+    ctx.closing.render && ctx.closing.render(t, ctx);
+  }
+
+  // Reduce Motion: the end state, still.
+  function renderReduced() {
+    const I = ctx.islandShape(0, 1); ctx.island = { ...I, open: 0, fold: 1 };
+    set(islandEl, { x: I.x, y: -30, width: I.w, height: I.h + 30, rx: I.r, opacity: 1 });
+    for (const l of ["back", "liquid", "inside", "dustIn", "white", "insideTop", "dustTop", "top", "bar"]) layer(l).style.display = "none";
+    drawRings(T.end, 1, 1, rings.map(() => 1), 0);
+    ctx.closing.render && ctx.closing.render(T.end, ctx);
+  }
+  const showAll = () => { for (const l of ["back", "liquid", "inside", "dustIn", "white", "insideTop", "dustTop", "top", "bar"]) layer(l).style.display = ""; };
+
+  // ═══════════════════════════════════════════════════════════════════════════════════════════
+  // Playback
+  // ═══════════════════════════════════════════════════════════════════════════════════════════
+  const speed = CONFIG.speed || 1, mq = window.matchMedia ? matchMedia("(prefers-reduced-motion: reduce)") : null;
+  state.reduced = !!(mq && mq.matches);
+  let last = 0, raf = 0;
+  const timeEl = document.getElementById("time"); if (timeEl) timeEl.max = T.end;
+  const draw = () => { render(state.t); if (timeEl) timeEl.value = state.t; };
+  function frame(now) {
+    const dt = Math.min(0.05, (now - last) / 1000) * speed; last = now;
+    state.t = Math.min(T.end, state.t + dt);
+    const target = state.pointer && ctx.character.looks && ctx.character.looks(state.t, ctx) ? state.pointer : { x: 0, y: 0 }, k = 1 - Math.exp(-dt / 0.11);
+    state.look.x += (target.x - state.look.x) * k; state.look.y += (target.y - state.look.y) * k;
+    draw();
+    if (state.t < T.end) raf = requestAnimationFrame(frame); else { state.playing = false; ctx.closing.onEnd && ctx.closing.onEnd(ctx, draw); }
+  }
+  function reset() { cancelAnimationFrame(raf); Object.assign(state, { look: { x: 0, y: 0 }, tapAt: -9, playing: false }); for (const ph of PHASES) ctx[ph].reset && ctx[ph].reset(ctx); }
+  let autoplay = 0;
+  function play() { clearTimeout(autoplay); reset(); state.t = 0; if (state.reduced) { draw(); return; } state.playing = true; last = performance.now(); raf = requestAnimationFrame(frame); }
+  function seek(t) { clearTimeout(autoplay); reset(); state.t = clamp(t, 0, T.end); draw(); }
+
+  const playEl = document.getElementById("play");
+  if (playEl) playEl.addEventListener("click", play);
+  if (timeEl) timeEl.addEventListener("input", e => seek(+e.target.value));
+  const stage = svg.parentElement;
+  stage.addEventListener("pointermove", e => { const r = stage.getBoundingClientRect(); state.pointer = { x: clamp(((e.clientX - r.left) / r.width - 0.5) * 2.4, -1, 1), y: clamp(((e.clientY - r.top) / r.height - 0.35) * 2, -1, 1) }; });
+  stage.addEventListener("pointerleave", () => { state.pointer = null; });
+  // A click goes to the character first (a poke), then to the closing (dismiss the pill).
+  stage.addEventListener("click", () => { for (const ph of ["character", "closing"]) if (ctx[ph].onClick && ctx[ph].onClick(state.t, ctx)) { if (!state.playing) draw(); return; } });
+  if (mq && mq.addEventListener) mq.addEventListener("change", e => { state.reduced = e.matches; showAll(); play(); });
+
+  const api = { play, seek, config: CONFIG, ctx, effects: Object.fromEntries(PHASES.map(p => [p, Object.keys(registry[p])])) };
+  window.notchLaunch = api;
+  draw();
+  autoplay = CONFIG.autoplay !== false ? setTimeout(play, 400) : 0;
+  return api;
+}
+
+window.NotchLaunch = { register, start, helpers: h, phases: PHASES };
+})();
+
+/*
+ * Opening: "burst"
+ * A drop swells out of the notch and sinks, the island floods open on a spring with a rippling lower edge,
+ * and bursts into dust that slows down to a hang and drifts. Times are on the opening clock (ctx.oc).
+ */
+NotchLaunch.register("opening", "burst", {
+  defaults: { flood: 0.5, burst: 0.58, response: 0.7, motes: 60, lobes: 11, spread: 320 },
+
+  setup(ctx) {
+    const { h, CX, open: O } = ctx, o = this.options = ctx.opening.options, rnd = ctx.rng("opening-burst");
+    // Glow behind everything, and the wave ring of the burst.
+    ctx.defs.insertAdjacentHTML("beforeend", `<radialGradient id="burstGlow"><stop offset="0" stop-color="#fff" stop-opacity=".16"/><stop offset=".5" stop-color="#fff" stop-opacity=".05"/><stop offset="1" stop-color="#fff" stop-opacity="0"/></radialGradient>`);
+    // Liquid parts (melted into the island by the goo filter): the first drop and the lobes of the rippling edge.
+    this.drop = h.make("circle", {}, ctx.layer("liquid"));
+    this.lobes = Array.from({ length: o.lobes }, (_, i) => ({ ph: i * 1.9, amp: 0.7 + rnd() * 0.5, el: h.make("circle", {}, ctx.layer("liquid")) }));
+    this.bloom = h.make("ellipse", { fill: "url(#burstGlow)", opacity: 0 }, ctx.layer("inside"));
+    this.motes = Array.from({ length: o.motes }, () => ({ x: rnd(), y: rnd(), r: 0.6 + rnd() * 1.0, ph: rnd() * Math.PI * 2, sp: 0.4 + rnd() * 0.6, lum: 0.2 + rnd() * 0.4 }));
+    this.motes.forEach(m => { m.el = h.make("circle", { fill: "#fff" }, ctx.layer("inside")); });
+    this.wave = h.make("ellipse", { fill: "none", stroke: "#fff", opacity: 0 }, ctx.layer("inside"));
+    // Each grain's flight out: its angle, speed and spin.
+    ctx.dust.forEach(p => { p.a = rnd() * Math.PI * 2; p.sp = 0.45 + rnd() * 0.55; p.spin = (rnd() - 0.5) * 1.6; });
+    this.cy = O.cy;
+  },
+
+  open(t, ctx) { return ctx.h.crit(ctx.oc(t) - this.options.flood, this.options.response); },
+
+  // Each grain flies out on a squashed ellipse, slowing exponentially to a hang, and drifts slowly round.
+  hang(p, t, ctx = this.ctx) {
+    const to = ctx.oc(t), o = this.options, b = 1 - Math.exp(-3.6 * Math.max(0, to - o.burst)), orbit = 0.1 * Math.max(0, to - 0.9);
+    const rr = (20 + o.spread * p.sp) * b, ang = p.a + p.spin * b * 1.2 + orbit;
+    return { x: ctx.CX + Math.cos(ang) * rr * 1.6, y: ctx.open.cy + Math.sin(ang) * rr * 0.55 };
+  },
+
+  dustAlpha(t, ctx) { const to = ctx.oc(t); return ctx.h.seg(to, this.options.burst, this.options.burst + 0.1); },
+
+  render(t, ctx) {
+    const { h, CX, notch, open: O, island: I, time: T } = ctx, { set, seg, span, inOut, soft, ease } = h, o = this.options, to = ctx.oc(t);
+    const sink = inOut(seg(to, 0, o.flood)), swell = soft(seg(to, 0, o.flood * 0.7));
+    set(this.drop, { cx: CX, cy: notch.h - 12 + 36 * sink, r: (2 + 15 * swell) * (1 - seg(to, o.flood, o.flood + 0.6)) });
+    const ripple = Math.exp(-Math.max(0, to - o.flood) * 2.2) * seg(to, o.flood, o.flood + 0.2) * (1 - I.fold);
+    this.lobes.forEach((l, i) => { const x = I.x + (i + 0.5) / this.lobes.length * I.w, r = (13 + 9 * l.amp * Math.sin(l.ph - (to - o.flood) * 9)) * ripple; set(l.el, { cx: x.toFixed(1), cy: I.h - 4, r: Math.max(0, r).toFixed(2) }); });
+    set(this.bloom, { cx: CX, cy: O.cy, rx: O.w * 0.42, ry: O.h * 0.7, opacity: (0.25 * span(to, o.flood, 1.0) * (1 - span(t, T.close - 0.3, 0.8))).toFixed(3) });
+    const moteA = span(to, o.flood + 0.1, 1.0) * (1 - span(t, T.close - 0.4, 0.7)), OX = CX - O.w / 2;
+    this.motes.forEach(p => { const x = OX + p.x * O.w + Math.sin(t * 0.7 * p.sp + p.ph) * 6, y = notch.h + 8 + ((p.y - t * 0.03 * p.sp) % 1 + 1) % 1 * (O.h - notch.h - 16);
+      set(p.el, { cx: x.toFixed(1), cy: y.toFixed(1), r: p.r, opacity: (p.lum * moteA * (0.6 + 0.4 * Math.sin(t * 1.3 + p.ph))).toFixed(3) }); });
+    const wv = seg(to, o.burst, o.burst + 0.8);
+    set(this.wave, { cx: CX, cy: O.cy, r: (18 + 440 * ease(wv)).toFixed(1), opacity: (to > o.burst ? 0.5 * (1 - wv) : 0).toFixed(3), "stroke-width": (2 * (1 - wv) + 0.3).toFixed(2), transform: `translate(${CX} ${O.cy}) scale(1 .42) translate(${-CX} ${-O.cy})` });
+  },
+});
+
+/*
+ * Character: "eyes"
+ * White liquid splashes out, lands, and gathers into two eyes, which hop, wink and blink hello, follow the
+ * pointer, and watch the dust being collected. At the end each eye comes apart into dust that streams into
+ * the rings on its side, filling the last part of them (from `takeOver` seconds after a ring starts filling).
+ */
+NotchLaunch.register("character", "eyes", {
+  defaults: {
+    color: "#ffffff", size: 34, drops: 46, eyeDust: 280,
+    eyeDustColors: ["#ffffff", "#ffffff", "#ffffff", "#ffffff", "#FF8A5C", "#8FC6FF", "#8B7CFF", "#FE3F03"],
+    splash: 0.7, form: 1.2, hello: 1.8,          // on the opening clock (ctx.oc)
+    takeOver: 1.55, takeOverStagger: 0.05,       // seconds after each ring starts filling
+    travel: 0.5,                                 // seconds an eye grain takes to reach its ring
+  },
+
+  setup(ctx) {
+    const { h } = ctx, o = this.options, rnd = ctx.rng("character-eyes");
+    this.drops = Array.from({ length: o.drops }, (_, i) => ({ vx: (rnd() - 0.5) * 2 * (80 + rnd() * 220), vy: -(30 + rnd() * 140), st: rnd() * 0.16, r: 2.4 + rnd() * 3.2, side: i % 2, g: 600 + rnd() * 160 }));
+    const white = ctx.layer("white"); white.setAttribute("fill", o.color);
+    this.drops.forEach(d => { d.el = h.make("circle", {}, white); });
+    this.eyes = [h.make("ellipse", {}, white), h.make("ellipse", {}, white)];
+    // A closed eye is drawn as a small arc (a smile when happy).
+    this.arcs = [0, 1].map(() => h.make("path", { fill: "none", stroke: o.color, "stroke-linecap": "round" }, ctx.layer("insideTop")));
+    // Which rings each eye feeds: the ones on its side (or all of them, if its side has none).
+    this.ringsOf = [-1, 1].map(side => { const mine = ctx.rings.filter(r => r.side === side); return (mine.length ? mine : ctx.rings).map(r => r.index); });
+    this.eyeDust = Array.from({ length: o.eyeDust }, (_, i) => { const u = Math.sqrt(rnd()), th = rnd() * Math.PI * 2, side = i % 2;
+      return { side, u, th, rel: (1 - u) * 0.34 + rnd() * 0.07, sw: (rnd() - 0.5) * 2, r: 0.6 + rnd() * 1.1, c: o.eyeDustColors[Math.floor(rnd() * o.eyeDustColors.length)],
+               ring: this.ringsOf[side][Math.floor(rnd() * this.ringsOf[side].length)] }; });
+    this.eyeDust.forEach(p => { p.el = h.grain(ctx.layer("top"), p.c, p.r, 1.2); });
+    this.pos = [{}, {}];
+  },
+
+  // From this moment each ring is fed by its eye instead of the dust.
+  claim(ring) { return ring.window[0] + this.options.takeOver + ring.index * this.options.takeOverStagger; },
+
+  // Once the core knows how much the dust fills (ctx.split), plan the eye grains into the rest: outer grains first.
+  plan(ctx) {
+    ctx.rings.forEach((r, i) => ctx.planLandings(i, this.eyeDust.filter(p => p.ring === i).sort((a, b) => a.rel - b.rel), ctx.split[i], 1));
+  },
+
+  // How much of eye s has already left, from its rings' fill curves.
+  gone(s, t, ctx) {
+    const list = this.ringsOf[s], tr = this.options.travel;
+    return list.reduce((sum, i) => sum + (ctx.split[i] >= 1 ? 0 : ctx.h.clamp((ctx.fillOf(i, t + tr) - ctx.split[i]) / (1 - ctx.split[i]))), 0) / list.length;
+  },
+
+  // The eyes' acting while the dust is collected: look down, follow the left side, then the right, then a happy squint.
+  face(t, ctx) {
+    const { hold, bell } = ctx.h, f = ctx.rings[0].window[0];
+    const dn = hold(t, f - 0.55, f - 0.25, f - 0.05, f + 0.2), L = hold(t, f - 0.1, f + 0.2, f + 0.3, f + 0.55), R = hold(t, f + 0.3, f + 0.6, f + 0.7, f + 0.95);
+    return { gx: -0.55 * (dn + L) + 0.55 * R, gy: 0.35 * dn - 0.4 * Math.max(L, R), tilt: 6 * (R - L - dn), dy: 2 * dn - 2 * Math.max(L, R), happy: 0.45 * bell(t, f + 0.75, f + 1.1), big: 0.08 * Math.max(L, R) };
+  },
+
+  // While they're there, the eyes follow the pointer, and a click pokes them.
+  looks(t, ctx) { return t > this.options.form + 0.6 && t < ctx.time.close - 0.4; },
+  onClick(t, ctx) { if (!this.looks(t, ctx)) return false; ctx.state.tapAt = t; return true; },
+
+  // Keep the dust off the eyes: near their height, grains are pushed softly towards their own side.
+  adjust(q, p, t, ctx) {
+    const { CX, h } = ctx, dx = q.x - CX, w = Math.exp(-Math.pow((q.y - (ctx.open.cy - 19)) / 45, 2)), f = ctx.rings[0].window[0];
+    const m = 80 * w * h.inOut(h.seg(t, f - 0.9, f - 0.4)), side = ctx.rings[p.ring].side;
+    if (m > 0.01) q.x = CX + dx + side * (Math.sqrt(dx * dx + m * m) - Math.abs(dx));
+    return q;
+  },
+
+  render(t, ctx) {
+    const { h, CX, open: O, state: S, time: T } = ctx, { set, seg, span, bell, blink, clamp, lerp, ease, inOut } = h, o = this.options, to = ctx.oc(t);
+    const lookOn = span(Math.min(t, 4.35), o.form + 0.6, 0.5) * (1 - span(t, T.close - 0.4, 0.4));
+    const hopF = seg(to, o.hello, o.hello + 0.5), hop = -16 * Math.sin(Math.PI * hopF) * (hopF < 1 ? 1 : 0);
+    const land = bell(to, o.hello + 0.45, o.hello + 0.75);
+    const tilt = 14 * Math.sin(Math.PI * span(to, o.hello + 0.55, 0.75, inOut)) * (1 - span(to, o.hello + 1.15, 0.25));
+    const fc = this.face(t, ctx);
+    const gx = clamp(S.look.x * 0.55 * lookOn + fc.gx, -0.9, 0.9), gy = clamp(S.look.y * 0.35 * lookOn + fc.gy, -0.7, 0.5);
+    const R = o.size * (1 + 0.05 * bell(t, S.tapAt, S.tapAt + 0.3)) * (1 + fc.big);
+    const ecx = CX + gx * R * 0.4, ecy = O.cy + hop + gy * R * 0.3 + fc.dy;
+
+    // The splash: drops fly out, fall, land on the floor, then gather into the eyes.
+    const floor = O.h - 12, y0 = O.cy - 6; let cond = 0;
+    this.drops.forEach(d => {
+      const tt = Math.max(0, to - o.splash - d.st);
+      let x = CX + d.vx * tt, y = y0 + d.vy * tt + 0.5 * d.g * tt * tt;
+      const landed = y > floor ? seg(y - floor, 0, 24) : 0; y = Math.min(y, floor + 4 * landed);
+      const u = inOut(seg(to, o.form + d.st * 2.0, o.form + 0.5 + d.st * 2.0)); cond += u;
+      const gap = R * 0.5 * lerp(1, 0.85, Math.abs(gx)), ex = ecx + (d.side ? 1 : -1) * gap;
+      const mx = lerp(x, ex, u), my = lerp(y, ecy, u) - 30 * Math.sin(u * Math.PI) * (1 - landed * 0.5);
+      const r = d.r * seg(tt, 0, 0.08) * (1 - landed * 0.35) * (1 - seg(u, 0.75, 1));
+      set(d.el, { cx: mx.toFixed(1), cy: my.toFixed(1), r: Math.max(0, r).toFixed(2), opacity: to > o.splash ? 1 : 0 });
+    });
+    // How formed the eyes are (with no drops, they simply fade in).
+    const formed = this.drops.length ? ease(cond / this.drops.length) : ease(seg(to, o.form, o.form + 0.5));
+    const closed = Math.max(blink(to, o.hello + 1.25, 0.5), blink(t, S.tapAt, 0.4), fc.happy);
+    const happy = (to > o.hello + 1.2 && to < o.hello + 1.8) || fc.happy > 0.02;
+    const wink = blink(to, o.hello + 0.65, 0.45);                       // the right eye winks alone
+    [-1, 1].forEach((d, i) => {
+      const openAmt = formed * Math.sqrt(1 - this.gone(i, t, ctx));     // shrinks as the eye turns to dust
+      const lean = tilt + fc.tilt, gap = R * 0.5 * lerp(1, 0.85, Math.abs(gx)), x = ecx + d * gap, y = ecy + d * Math.sin(lean * Math.PI / 180) * gap * 0.6;
+      const shut = Math.max(closed, i ? wink : 0), squash = 1 - 0.22 * land, rot = lean - gx * 9;
+      const rx = R * 0.29 * openAmt * lerp(1, 0.85, Math.abs(gx)) * (2 - squash), ry = R * 0.5 * openAmt * squash * (1 - shut);
+      set(this.eyes[i], { cx: x, cy: y, rx: Math.max(0, rx), ry: Math.max(0, ry), transform: `rotate(${rot.toFixed(2)} ${x} ${y})`, opacity: shut > 0.92 ? 0 : 1 });
+      const w = rx * 2.2, lift = happy ? -R * 0.16 : (i && wink > 0.6 ? -R * 0.1 : 0);
+      set(this.arcs[i], { d: `M ${x - w / 2} ${y + (happy ? R * 0.05 : 0)} q ${w / 2} ${lift} ${w} 0`, "stroke-width": Math.max(0.5, R * 0.09 * openAmt), opacity: (clamp((shut - 0.6) / 0.4) * openAmt).toFixed(3) });
+      Object.assign(this.pos[i], { x, y, rx0: R * 0.29 * formed * lerp(1, 0.85, Math.abs(gx)), ry0: R * 0.5 * formed, rot: (tilt - gx * 9) * Math.PI / 180 });
+    });
+
+    // The eyes come apart: each grain curves up into the tip of its ring's arc, landing when the fill curve says.
+    const eyeE = this.eyeE || (this.eyeE = h.bez(.45, 0, .3, 1)), tr = o.travel;
+    this.eyeDust.forEach(p => {
+      const E = this.pos[p.side], tau = t - (p.L - tr);
+      if (tau <= 0 || tau >= tr || formed < 0.5) { h.hideGrain(p.el); return; }
+      const lx = p.u * Math.cos(p.th) * E.rx0, ly = p.u * Math.sin(p.th) * E.ry0, c = Math.cos(E.rot), s = Math.sin(E.rot);
+      const bx = E.x + lx * c - ly * s, by = E.y + lx * s + ly * c, ring = ctx.rings[p.ring], d = ring.side;
+      const at = u => h.quad({ x: bx + Math.cos(p.th) * 5 * u, y: by + Math.sin(p.th) * 3 * u }, { x: CX + d * (112 + ring.slot * 64) + p.sw * 10, y: lerp(by, 52, 0.6) }, ctx.tipAt(p.ring, p.f), eyeE(u));
+      const u = tau / tr, q = at(u), q0 = at(Math.max(0, u - 0.05));
+      const a = seg(u, 0, 0.1) * (1 - seg(u, 0.9, 1)) * clamp((ctx.island.h - 3 - q.y) / 6);
+      h.drawGrain(p.el, q, q0, 7, a, a * 0.45);
+      p.el.children[1].setAttribute("r", (p.r * (1 - 0.3 * u)).toFixed(2));
+    });
+  },
+});
+
+/*
+ * Fill: "ribbons"
+ * Each ring reels its dust in on a ribbon that runs in from the outer corner along the bottom of the island,
+ * curls up in a lazy S and rises into the ring. Each grain is picked up where the ribbon passes nearest to it,
+ * eases onto it and rides it in; the ribbon narrows towards the ring and ripples as it runs. In the last stretch
+ * the ribbon bends to the current tip of the ring's arc, so the stream visibly extends the ring.
+ */
+NotchLaunch.register("fill", "ribbons", {
+  defaults: {
+    speed: 0.95,          // ribbon lengths per second
+    easeIn: 0.35,         // seconds to get up to speed
+    width: 22,            // how wide the stream is at its start
+    pickUp: 0.75,         // seconds a grain takes to drift onto the ribbon
+    // The ribbon's shape: [distance out from the centre, y] points, mirrored for the right side.
+    path: [[340, 172], [252, 175], [170, 154], [150, 118], [186, 88], [248, 66], [262, 40]],
+  },
+
+  setup(ctx) {
+    const { h, CX } = ctx, o = this.options, rnd = ctx.rng("fill-ribbons");
+    // One ribbon per ring: a Catmull–Rom curve through the points, measured by arc length so speed along it is even.
+    this.ribs = ctx.rings.map(r => {
+      const P = o.path.map(([x, y]) => ({ x: CX + r.side * x, y })); P.push({ x: r.x, y: 22 });
+      const pts = []; for (let i = 0; i < P.length - 1; i++) { const p0 = P[Math.max(0, i - 1)], p1 = P[i], p2 = P[i + 1], p3 = P[Math.min(P.length - 1, i + 2)];
+        for (let k = 0; k < 60; k++) { const u = k / 60, u2 = u * u, u3 = u2 * u;
+          pts.push({ x: 0.5 * (2 * p1.x + (-p0.x + p2.x) * u + (2 * p0.x - 5 * p1.x + 4 * p2.x - p3.x) * u2 + (-p0.x + 3 * p1.x - 3 * p2.x + p3.x) * u3),
+                     y: 0.5 * (2 * p1.y + (-p0.y + p2.y) * u + (2 * p0.y - 5 * p1.y + 4 * p2.y - p3.y) * u2 + (-p0.y + 3 * p1.y - 3 * p2.y + p3.y) * u3) }); } }
+      pts.push(P[P.length - 1]);
+      const len = [0]; for (let i = 1; i < pts.length; i++) len.push(len[i - 1] + Math.hypot(pts[i].x - pts[i - 1].x, pts[i].y - pts[i - 1].y));
+      return { pts, len, total: len[len.length - 1] };
+    });
+    // Where each grain joins its ribbon: the nearest point to where it hangs.
+    const hangT = ctx.rings[0].window[0] - 0.4;
+    ctx.dust.forEach(p => {
+      p.w1 = rnd() * 6.3; p.u4 = rnd();
+      const H = ctx.opening.hang(p, hangT, ctx); let best = 0, bd = 1e9;
+      for (let k = 0; k <= 70; k++) { const q = this.at(p.ring, k / 100), dd = Math.hypot(q.x - H.x, (q.y - H.y) * 1.3); if (dd < bd) { bd = dd; best = k / 100; } }
+      p.sj = best; p.tr = (1 - p.sj) / o.speed + o.easeIn / 2;            // its travel time along the ribbon
+    });
+    // Plan the landings: grains nearest the ring land first, up to the share of the ring the dust fills.
+    ctx.rings.forEach((r, i) => ctx.planLandings(i, ctx.dust.filter(p => p.ring === i).sort((a, b) => b.sj - a.sj), 0, ctx.split[i]));
+  },
+
+  // A point a fraction s (0–1) along ring i's ribbon, with its normal.
+  at(i, s) {
+    const R = this.ribs[i], L = Math.min(1, Math.max(0, s)) * R.total; let a = 0, b = R.len.length - 1;
+    while (b - a > 1) { const m = (a + b) >> 1; if (R.len[m] < L) a = m; else b = m; }
+    const f = (L - R.len[a]) / Math.max(1e-6, R.len[b] - R.len[a]), A = R.pts[a], B = R.pts[b], dl = Math.hypot(B.x - A.x, B.y - A.y) || 1;
+    return { x: A.x + (B.x - A.x) * f, y: A.y + (B.y - A.y) * f, nx: -(B.y - A.y) / dl, ny: (B.x - A.x) / dl };
+  },
+
+  pos(p, t, ctx) {
+    const { h } = ctx, o = this.options, J = p.L - p.tr, tau = t - J;
+    const ride = tau <= 0 ? 0 : tau < o.easeIn ? tau * tau / (2 * o.easeIn) : tau - o.easeIn / 2;
+    const s = Math.min(1, p.sj + o.speed * ride);
+    // On the ribbon: spread across it (narrowing towards the ring), rippling, and bent into the ring's tip at the end.
+    const q = this.at(p.ring, s), w = Math.pow(1 - s, 0.8), off = (p.u4 - 0.5) * o.width * w + 3.5 * Math.sin(10 * s - 6 * t + p.w1) * w;
+    const tip = ctx.tipAt(p.ring, p.f), end = this.at(p.ring, 1), k = h.C5(h.seg(s, 0.8, 1));
+    const Q = { x: q.x + q.nx * off + (tip.x - end.x) * k, y: q.y + q.ny * off + (tip.y - end.y) * k };
+    // Before it's picked up the grain hangs where the opening left it; it drifts onto the ribbon over `pickUp` seconds.
+    const H = ctx.opening.hang(p, t, ctx), g = h.inOut(h.seg(t, J - o.pickUp, J));
+    return { x: h.lerp(H.x, Q.x, g), y: h.lerp(H.y, Q.y, g), v: t > J ? h.seg(s, p.sj, 1) : 0 };
+  },
+});
+
+/*
+ * Closing: "fold"
+ * The island folds back into a bar on a spring just before the rings are full, a glint runs along the bar,
+ * and a pill appears under it with an outline that draws itself once. The pill fades after a while or on a click.
+ */
+NotchLaunch.register("closing", "fold", {
+  defaults: { text: "Click for details", response: 0.8, hideAfter: 8 },
+
+  setup(ctx) {
+    const { h } = ctx;
+    ctx.defs.insertAdjacentHTML("beforeend", `<linearGradient id="foldGlint" gradientUnits="userSpaceOnUse" x1="0" y1="0" x2="120" y2="0"><stop offset="0" stop-color="#fff" stop-opacity="0"/><stop offset=".5" stop-color="#fff" stop-opacity=".9"/><stop offset="1" stop-color="#fff" stop-opacity="0"/></linearGradient>`);
+    this.glint = h.make("path", { fill: "none", stroke: "url(#foldGlint)", "stroke-width": 1.4, "stroke-linecap": "round", opacity: 0 }, ctx.layer("bar"));
+    const g = this.pill = h.make("g", { opacity: 0 }, ctx.layer("overlay"));
+    this.box = h.make("rect", { height: 24, rx: 12, fill: "rgba(20,21,26,.92)", stroke: "rgba(255,255,255,.08)" }, g);
+    this.outline = h.make("rect", { height: 24, rx: 12, fill: "none", stroke: "#fff", "stroke-opacity": .75, "stroke-width": 1 }, g);
+    this.icon = h.make("path", { d: "M0 0 L0 12 L3.2 9.2 L5.4 13.6 L7.2 12.8 L5 8.6 L9 8.6 Z", fill: "#fff", stroke: "#000", "stroke-width": .8, "stroke-linejoin": "round" }, g);
+    this.label = h.make("text", { fill: "#fff", "font-family": "-apple-system, system-ui, sans-serif", "font-size": 11.5, "font-weight": 500 }, g);
+    this.label.textContent = this.options.text;
+    this.gone = false;
+  },
+
+  fold(t, ctx) { return ctx.h.crit(t - (ctx.time.close - 0.35), this.options.response); },
+
+  render(t, ctx) {
+    const { h, CX, notch, bar, time: T, state } = ctx, { set, seg, bell, lerp, ease } = h, reduced = state.reduced;
+    // The glint along the bottom of the bar.
+    const a0 = T.hint - 0.45, a1 = T.hint + 0.15, y = notch.h - 0.6, x0 = CX - bar.w / 2 + 14, x1 = CX + bar.w / 2 - 14;
+    set(this.glint, { d: `M ${x0} ${y} L ${x1} ${y}`, opacity: reduced ? 0 : (bell(t, a0, a1) * 0.9).toFixed(3) });
+    document.getElementById("foldGlint").setAttribute("gradientTransform", `translate(${lerp(x0 - 120, x1, seg(t, a0, a1))} 0)`);
+    // The pill, laid out from the text's real width.
+    const at = T.hint, PAD = 12, GAP = 5, IW = 10, IH = 14, tw = this.label.getComputedTextLength();
+    const w = PAD + IW + GAP + tw + PAD, x = CX - w / 2, top = notch.h + 12, a = reduced ? 1 : ease(seg(t, at, at + 0.4));
+    set(this.pill, { opacity: (a * (this.gone ? 0 : 1)).toFixed(3), transform: `translate(0 ${((1 - a) * -6).toFixed(2)})` });
+    set(this.box, { x, y: top, width: w });
+    const per = 2 * (w + 24) - (4 - Math.PI) * 24, draw = reduced ? 0 : ease(seg(t, at + 0.05, at + 0.95));
+    set(this.outline, { x, y: top, width: w, "stroke-dasharray": per.toFixed(1), "stroke-dashoffset": (per * (1 - draw)).toFixed(1), opacity: reduced ? 0 : (0.25 + 0.75 * (1 - seg(t, at + 0.95, at + 1.5))).toFixed(3) });
+    set(this.icon, { transform: `translate(${x + PAD} ${top + (24 - IH) / 2})` });
+    set(this.label, { x: x + PAD + IW + GAP, y: top + 16 });
+  },
+
+  hide(fade) { this.pill.style.transition = `opacity ${fade}s cubic-bezier(.32,.72,0,1)`; this.gone = true; },
+  onEnd(ctx, redraw) { clearTimeout(this.timer); this.timer = setTimeout(() => { this.hide(0.4); redraw(); }, this.options.hideAfter * 1000); },
+  onClick(t, ctx) { if (t < ctx.time.hint) return false; this.hide(0.25); return true; },
+  reset() { clearTimeout(this.timer); if (this.pill) this.pill.style.transition = ""; this.gone = false; },
+});
+
+NotchLaunch.start(CONFIG);
+</script>
+</body>
+</html>
