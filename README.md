@@ -1,5 +1,9 @@
 # Notch Launch Animation
 
+![Notch Launch Animation preview](preview.gif)
+
+**[▶ Live demo](https://bborakurt.github.io/notch-launch-animation/)**
+
 A first-launch animation that opens out of a laptop notch: the notch floods open and bursts into coloured dust, a pair of eyes forms and says hello, the dust is reeled into progress rings, and the island folds back into a bar.
 
 **One file, `index.html`.** Plain SVG and JavaScript: no libraries, no build step, no assets. Open it in a browser.
